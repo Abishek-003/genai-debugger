@@ -1,0 +1,16 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0d1117; --surface: #161b22; --surface2: #21262d;
+  --border: rgba(255,255,255,0.08);
+  --text: #e6edf3; --muted: #8b949e; --faint: #484f58;
+  --primary: #58a6ff; --success: #3fb950;
+  --error: #f85149; --warning: #d29922;
+  --mono: 'Fira Code', monospace;
+}
+body {
+  font-family: 'Satoshi', system-ui, sans-serif;
+  background: var(--bg); color: var(--text);
+  min-height: 100dvh; -webkit-font-smoothing: antialiased; line-height: 1.6;
+}
+button { cursor: pointer; font: inherit; border: none; background: none; color: inherit; }
+textarea { font: inherit; }
