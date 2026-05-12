@@ -1,4 +1,5 @@
 import ast
+import re
 import time
 import textwrap
 import requests
@@ -67,7 +68,7 @@ def ast_detect_bugs(source: str) -> list:
     """
     Deterministically find bug patterns:
     - =+ instead of +=   (UnaryOp UAdd assignment)
-    - Bare division       (flags for LLM to trace call-chain)
+    - Bare division      (flags for LLM to trace call-chain)
     - max()/min() no guard
     - Mutable module-level globals
     - Date string >= comparison
@@ -86,6 +87,7 @@ def ast_detect_bugs(source: str) -> list:
     # ── Pass 1: collect module-level mutable names ─────────────────────────────
     mutable_globals = []
     MUTABLE_BUILTINS = {"dict", "list", "defaultdict", "set", "OrderedDict"}
+
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.Assign):
             for t in node.targets:
@@ -93,8 +95,6 @@ def ast_detect_bugs(source: str) -> list:
                     continue
                 v = node.value
                 if isinstance(v, (ast.Dict, ast.List, ast.Set)):
-                    mutable_globals.append((t.id, node.lineno))
-                elif isinstance(v, ast.Constant) and v.value in (0, "", 0.0):
                     mutable_globals.append((t.id, node.lineno))
                 elif isinstance(v, ast.Call):
                     func_name = ""
@@ -182,22 +182,18 @@ def ast_detect_bugs(source: str) -> list:
 # ─── Prompt helpers ────────────────────────────────────────────────────────────
 
 def _get_fix_principles() -> str:
-    """
-    Generic fix principles — teach correct reasoning patterns,
-    not specific rules for specific bugs.
-    """
     return (
         "### Fix principles:\n"
         "1. When guarding against a zero/empty/None value, the safe fallback must be "
         "semantically correct — not just syntactically safe. "
         "Ask: what should the caller receive when the value is missing? "
-        "Return that value, not an arbitrary substitute like 1 or \'dummy\'.\n"
+        "Return that value, not an arbitrary substitute like 1 or 'dummy'.\n"
         "   Good: `return a / b if b != 0 else 0`  ← 0 is the correct answer when there is nothing to divide\n"
         "   Bad:  `return a / (b if b != 0 else 1)` ← silently returns wrong result\n\n"
         "2. When a container guard is needed, use an explicit `if container` check — "
         "not a keyword argument that does not exist on the built-in.\n"
         "   Good: `return max(items, key=...) if items else None`\n"
-        "   Bad:  `return max(items, key=..., default=None)`  ← max() has no default kwarg\n\n"
+        "   Bad:  `return max(items, key=..., default=None)` ← max() has no default kwarg\n\n"
         "3. When a mutable value is passed to a helper by value (e.g. an int counter), "
         "changes inside the helper are invisible to the caller. "
         "The helper must return the updated value and the caller must reassign it.\n"
@@ -231,8 +227,8 @@ def _get_examples() -> str:
         "Fix:\n"
         "```python\n"
         "def run(items):\n"
-        "    hits   = 0\n"
-        "    cache  = {}\n"
+        "    hits = 0\n"
+        "    cache = {}\n"
         "    totals = defaultdict(dict)\n"
         "    for item in items:\n"
         "        hits = process(item[\"id\"], item[\"score\"], cache, totals, hits)\n"
@@ -273,7 +269,8 @@ def _get_output_rules() -> str:
         "### Output rules:\n"
         "- Quote the exact buggy line for every bug\n"
         "- Fix block: corrected code only, 1-3 lines\n"
-        "- Silent about non-bugs — never write \'not a bug\' or \'no change needed\'\n"
+        "- Silent about non-bugs — never write 'not a bug' or 'no change needed'\n"
+        "- Start numbering at Bug 1\n"
         "- No ### headers, no bullet format\n\n"
     )
 
@@ -292,19 +289,22 @@ def _build_slim_prompt(confirmed_bugs: list, code: str, logs: str,
             f"### Confirmed bugs (static analysis):\n{bug_list}\n\n"
             "### Your job:\n"
             "1. Write a Bug N block for each confirmed bug above.\n"
-            "2. Check logs for additional semantic bugs NOT in the list.\n\n"
+            "2. Start numbering at Bug 1.\n"
+            "3. Check logs for additional semantic bugs NOT in the list.\n\n"
         )
     else:
         task = (
             "### Your job:\n"
-            "Analyze the code and logs. Report only clearly visible bugs.\n\n"
+            "Analyze the code and logs. Report only clearly visible bugs.\n"
+            "Start numbering at Bug 1.\n\n"
         )
 
     if first_answer:
         task = (
             f"### Already reported — do NOT repeat:\n{first_answer}\n\n"
             "### Your job:\n"
-            "Find ONLY bugs missed above. If none → reply: No additional bugs found.\n\n"
+            "Find ONLY bugs missed above. If none → reply: No additional bugs found.\n"
+            "Continue Bug N format.\n\n"
         )
 
     return (
@@ -355,7 +355,7 @@ def critique_answer(query: str, code: str, logs: str, answer: str) -> str:
         "7. Date string comparison bug caught with correct stored format.\n"
         "8. Int counters passed to helpers: does helper return updated value, caller reassign?\n"
         "9. No duplicates. No non-existent kwarg usage. No thread/lock suggestions.\n"
-        "10. No \'not a bug\' or \'no change needed\' entries.\n\n"
+        "10. No 'not a bug' or 'no change needed' entries.\n\n"
         f"### Code:\n```python\n{code}\n```\n\n"
         f"### Logs:\n{logs_text}\n\n"
         f"### Answer:\n{answer}\n\n"
@@ -386,7 +386,7 @@ def refine_answer(query: str, code: str, logs: str,
         "- KEEP valid bugs\n"
         "- ADD confirmed missing bugs\n"
         "- REMOVE: invented lines, duplicates, non-existent kwargs, "
-        "wrong fallback values, thread/lock suggestions, \'not a bug\' entries\n"
+        "wrong fallback values, thread/lock suggestions, 'not a bug' entries\n"
         "- Bug N: / Issue: / Explanation: / Fix: format only\n\n"
         f"### Code:\n```python\n{code}\n```\n\n"
         f"### Logs:\n{logs_text}\n\n"
@@ -399,7 +399,6 @@ def refine_answer(query: str, code: str, logs: str,
 # ─── Deduplication ─────────────────────────────────────────────────────────────
 
 def deduplicate_bugs(text: str) -> str:
-    # Strip separator before processing so second-pass blocks merge cleanly
     text = text.replace("--- Additional Bugs Found ---", "").strip()
 
     seen = set()
@@ -444,17 +443,34 @@ def deduplicate_bugs(text: str) -> str:
     return "\n".join(output)
 
 
+def renumber_bugs(text: str, start: int = 1) -> str:
+    counter = start
+
+    def repl(match):
+        nonlocal counter
+        value = f"Bug {counter}:"
+        counter += 1
+        return value
+
+    return re.sub(
+        r"(?im)^bug\s+\d+\s*:",
+        repl,
+        text,
+        flags=re.MULTILINE
+    )
+
+
 # ─── Response quality filters ─────────────────────────────────────────────────
 
 def is_bad_response(text: str) -> bool:
     tl = text.lower()
     bad = [
-        "fibonacci", "i don\'t see any code", "no code was provided",
+        "fibonacci", "i don't see any code", "no code was provided",
         "without running", "speculative", "impossible to find",
         "from queue import", "lock = lock()", "with lock:",
         "lock.acquire", "semaphore", "asyncio", "multiprocessing",
         "error after 3 attempts", "error after 2 attempts",
-        "i\'m ready", "i am ready", "please provide the code",
+        "i'm ready", "i am ready", "please provide the code",
         "waiting for the code", "ready to analyze",
         "t.join()", "race condition",
         ".clear()  # clear", "active_sessions.clear()",
@@ -462,12 +478,9 @@ def is_bad_response(text: str) -> bool:
         "dept_scores.clear()",
         "### bug 1", "### bug 2", "### bug 3",
         "- **description**:", "- **impact**:",
-        # Wrong fix patterns
         "+ 0.001", "+ 1e-", "epsilon",
-        "else 1))", "else 1) *", "!= 0 else 1)",  # wrong fallback
-        ", default=none)",                          # non-existent kwarg
-        "default=none",
-        # Non-bug reporting
+        "else 1))", "else 1) *", "!= 0 else 1)",
+        ", default=none)", "default=none",
         "no change needed", "is already correct",
         "not a bug here", "no bug here", "not a bug",
     ]
@@ -494,18 +507,18 @@ def is_correct_line_flagged(text: str) -> bool:
 def run_pipeline(query: str, code: str, logs: str) -> dict:
     if is_off_topic(query, code):
         return {
-            "ast_bugs":       [],
+            "ast_bugs": [],
             "initial_answer": "This tool only answers code debugging questions.",
-            "critique":       "Skipped — off-topic",
-            "final_answer":   "This tool only answers code debugging questions. Please provide a code snippet."
+            "critique": "Skipped — off-topic",
+            "final_answer": "This tool only answers code debugging questions. Please provide a code snippet."
         }
 
     if not code or not code.strip():
         return {
-            "ast_bugs":       [],
+            "ast_bugs": [],
             "initial_answer": "No code provided.",
-            "critique":       "Skipped — no code",
-            "final_answer":   "No code provided. Please paste a code snippet to debug."
+            "critique": "Skipped — no code",
+            "final_answer": "No code provided. Please paste a code snippet to debug."
         }
 
     if not query or not query.strip():
@@ -522,10 +535,10 @@ def run_pipeline(query: str, code: str, logs: str) -> dict:
         initial = generate_answer(confirmed_bugs, query, code, logs)
     if is_bad_response(initial):
         return {
-            "ast_bugs":       confirmed_bugs,
-            "initial_answer": initial,
-            "critique":       "Skipped — bad initial response",
-            "final_answer":   initial
+            "ast_bugs": confirmed_bugs,
+            "initial_answer": renumber_bugs(initial, start=1),
+            "critique": "Skipped — bad initial response",
+            "final_answer": renumber_bugs(initial, start=1)
         }
 
     # Step 3 — second pass for code > 20 lines
@@ -543,7 +556,7 @@ def run_pipeline(query: str, code: str, logs: str) -> dict:
         except Exception:
             pass
 
-    # Step 4 — dedup (also strips separator)
+    # Step 4 — dedup
     combined = deduplicate_bugs(combined)
 
     # Step 5 — critique + refine (only when logs present)
@@ -581,12 +594,13 @@ def run_pipeline(query: str, code: str, logs: str) -> dict:
             critique = "Skipped — timeout"
             final = combined
 
-    # Step 6 — final dedup
+    # Step 6 — final dedup + force numbering from Bug 1
     final = deduplicate_bugs(final)
+    final = renumber_bugs(final, start=1)
 
     return {
-        "ast_bugs":       confirmed_bugs,
-        "initial_answer": initial,
-        "critique":       critique,
-        "final_answer":   final
+        "ast_bugs": confirmed_bugs,
+        "initial_answer": renumber_bugs(initial, start=1),
+        "critique": critique,
+        "final_answer": final
     }
