@@ -135,7 +135,7 @@ GENAI-DEBUGGER/
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/genai-debugger.git
+git clone https://github.com/Abishek-003/genai-debugger.git
 cd genai-debugger
 ```
 
@@ -188,7 +188,7 @@ npm install
 npm run dev
 ```
 
-Vite uses port `5173` by default in development unless overridden in config or CLI flags.[4][6][8]
+
 
 - Frontend: `http://localhost:5173`
 - Backend: `http://localhost:8000`
@@ -225,35 +225,6 @@ Vite uses port `5173` by default in development unless overridden in config or C
   "final_answer": "Bug 1:\nIssue: `total =+ x`\nExplanation: ...\nFix:\n```python\ntotal += x\n```"
 }
 ```
-
-***
-
-## Python Usage
-
-```python
-from services.llm_service import run_pipeline
-
-result = run_pipeline(
-    query="Identify all the bugs",
-    code=your_code_string,
-    logs="ZeroDivisionError on line 12"
-)
-
-print(result["final_answer"])
-```
-
-If the current pipeline includes output normalization, the final answer should be renumbered from `Bug 1` before returning to the caller.
-
-***
-
-## Fix Principles
-
-The prompt design uses general debugging principles instead of overfitting to a single checklist:
-
-1. Safe fallbacks must be semantically correct.
-2. Empty-container guards should use explicit `if container` checks.
-3. Integer counters passed into helpers must be returned and reassigned when updated.
-4. Mutable module-level state should move inside the entry function and be passed explicitly where needed.
 
 ***
 
