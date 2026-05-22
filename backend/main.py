@@ -15,12 +15,12 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("🚀 Starting Ollama Backend...")
+    logger.info(" Starting Ollama Backend...")
     from rag.vector_store import vectorstore  # ← fixed: was 'index, documents'
-    logger.info(f"✅ RAG vectorstore loaded — {vectorstore.index.ntotal} chunks ready")
+    logger.info(f" RAG vectorstore loaded — {vectorstore.index.ntotal} chunks ready")
     yield
     # Shutdown
-    logger.info("🛑 Shutting down Ollama Backend...")
+    logger.info(" Shutting down Ollama Backend...")
 
 
 app = FastAPI(
@@ -46,4 +46,4 @@ app.include_router(query_router)
 
 @app.get("/", tags=["Health"])
 async def home():
-    return {"status": "ok", "message": "Ollama Backend Running 🚀"}
+    return {"status": "ok", "message": "Ollama Backend Running "}
