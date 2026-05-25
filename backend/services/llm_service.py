@@ -1,18 +1,27 @@
 import ast
+import json
 import re
 import time
 import textwrap
+
 import requests
 from rag.vector_store import retrieve
 
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "qwen2.5-coder:7b-instruct"
+REQUEST_TIMEOUT = 180
+NUM_PREDICT = 1400
+NO_CONTEXT = "No relevant context."
+IRRELEVANT_MESSAGE = "Sorry I cant help you with this"
 
 
 # ─── Ollama caller ─────────────────────────────────────────────────────────────
 
-def call_ollama(prompt: str, retries: int = 2) -> str:
+
+def call_ollama(prompt: str, retries: int = 2, temperature: float = 0) -> str:
+    last_error = None
+
     for attempt in range(retries + 1):
         try:
             response = requests.post(
@@ -21,73 +30,201 @@ def call_ollama(prompt: str, retries: int = 2) -> str:
                     "model": MODEL,
                     "prompt": prompt,
                     "stream": False,
-                    "temperature": 0,
-                    "options": {"num_predict": 1024}
+                    "temperature": temperature,
+                    "options": {"num_predict": NUM_PREDICT},
                 },
-                timeout=180
+                timeout=REQUEST_TIMEOUT,
             )
             response.raise_for_status()
             result = response.json().get("response", "")
             if not result.strip():
                 raise ValueError("Empty response from model")
-            result = (
-                result
-                .replace("<|begin▁of▁sentence|>", "")
-                .replace("<|end▁of▁sentence|>", "")
-                .strip()
-            )
+
+            result = re.sub(r"<\|[^|]+\|>", "", result).strip()
             return result
+
         except (KeyError, ValueError, requests.RequestException) as e:
+            last_error = e
             if attempt == retries:
-                return f"Error after {retries + 1} attempts: {str(e)}"
+                return f"Error after {retries + 1} attempts: {str(last_error)}"
             time.sleep(2)
 
 
-# ─── Off-topic guard ───────────────────────────────────────────────────────────
+# ─── LLM router ────────────────────────────────────────────────────────────────
 
-def is_off_topic(query: str, code: str) -> bool:
+
+def _looks_like_debug_request(query: str, code: str, logs: str) -> bool:
     if code and code.strip():
-        return False
-    off_topic_signals = [
-        "hello", "hi ", "hey ", "how are you", "what is your name",
-        "who are you", "good morning", "good evening",
-        "what is the capital", "tell me about", "explain quantum",
-        "write a poem", "write an essay", "write a story",
-        "what is love", "recommend a movie", "recommend a book",
-        "weather today", "stock price",
-        "write a function", "write code for", "implement a",
-        "create a script", "generate code",
-        "recipe for", "how to cook", "best restaurant",
+        return True
+
+    combined = f"{query or ''}\n{logs or ''}".lower()
+    debug_signals = [
+        "traceback",
+        "exception",
+        "error",
+        "bug",
+        "debug",
+        "fix",
+        "zerodivisionerror",
+        "indexerror",
+        "keyerror",
+        "typeerror",
+        "valueerror",
+        "syntaxerror",
+        "attributeerror",
+        "nameerror",
+        "python",
     ]
-    return any(s in query.lower() for s in off_topic_signals)
+    return any(signal in combined for signal in debug_signals)
+
+
+def route_prompt(query: str, code: str, logs: str) -> str:
+    if _looks_like_debug_request(query, code, logs):
+        return "DEBUG"
+
+    prompt = f"""
+You are a routing classifier for a Python bug-finding assistant.
+
+The assistant handles:
+- debugging Python code
+- finding bugs in Python code
+- fixing Python errors
+- analyzing Python tracebacks or logs
+- reviewing Python code for bugs
+
+The assistant does NOT handle:
+- casual chat
+- general knowledge
+- recipes, poems, essays, stories
+- non-debugging tasks unrelated to Python bug/error finding
+
+Return ONLY valid JSON in exactly one of these forms:
+{{"decision":"DEBUG"}}
+{{"decision":"REJECT","message":"{IRRELEVANT_MESSAGE}"}}
+
+Rules:
+- If code is present, strongly prefer DEBUG.
+- If logs/tracebacks/exceptions are present, strongly prefer DEBUG.
+- If the user is asking for Python bug/error analysis, prefer DEBUG.
+- Otherwise return REJECT.
+
+Query:
+{query or ""}
+
+Code:
+```python
+{code or ""}
+```
+
+Logs:
+{logs or ""}
+""".strip()
+
+    raw = call_ollama(prompt, retries=1, temperature=0)
+
+    try:
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        payload = json.loads(match.group(0) if match else raw)
+        decision = str(payload.get("decision", "")).strip().upper()
+        if decision == "DEBUG":
+            return "DEBUG"
+        return "REJECT"
+    except Exception:
+        return "REJECT"
+
+
+# ─── Context helper ────────────────────────────────────────────────────────────
+
+
+def _get_context(query: str, code: str = "", logs: str = "") -> str:
+    retrieval_query = query.strip() if query and query.strip() else "python bug debugging"
+    signals = set()
+
+    try:
+        if code and code.strip():
+            tree = ast.parse(textwrap.dedent(code))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef):
+                    signals.add(node.name)
+                elif isinstance(node, ast.AsyncFunctionDef):
+                    signals.add(node.name)
+                elif isinstance(node, ast.ClassDef):
+                    signals.add(node.name)
+                elif isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name):
+                        signals.add(node.func.id)
+                    elif isinstance(node.func, ast.Attribute):
+                        signals.add(node.func.attr)
+    except Exception:
+        pass
+
+    if logs:
+        for m in re.findall(r"\b[A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning)\b", logs):
+            signals.add(m)
+
+    if signals:
+        retrieval_query += "\n" + " ".join(sorted(signals)[:40])
+
+    try:
+        context = retrieve(retrieval_query)
+        return "\n- ".join(context) if context else NO_CONTEXT
+    except Exception:
+        return NO_CONTEXT
 
 
 # ─── AST Pre-Detector ─────────────────────────────────────────────────────────
 
-def ast_detect_bugs(source: str) -> list:
-    """
-    Deterministically find bug patterns:
-    - =+ instead of +=   (UnaryOp UAdd assignment)
-    - Bare division      (flags for LLM to trace call-chain)
-    - max()/min() no guard
-    - Mutable module-level globals
-    - Date string >= comparison
-    """
-    bugs = []
+
+def ast_detect_bugs(source: str, logs: str = "") -> dict:
+    findings = {"bugs": [], "risks": [], "smells": []}
+
     try:
         tree = ast.parse(textwrap.dedent(source))
     except SyntaxError as e:
-        return [{"line": 0, "code": str(e), "type": "SyntaxError — fix before analysis"}]
+        return {
+            "bugs": [{"line": 0, "code": str(e), "type": "SyntaxError — fix before analysis"}],
+            "risks": [],
+            "smells": [],
+        }
 
     lines = source.splitlines()
+    mutable_builtins = {"dict", "list", "defaultdict", "set", "OrderedDict", "Counter", "deque"}
 
     def get_line(node):
-        return lines[node.lineno - 1].strip() if node.lineno <= len(lines) else ""
+        lineno = getattr(node, "lineno", 0)
+        return lines[lineno - 1].strip() if 0 < lineno <= len(lines) else ""
 
-    # ── Pass 1: collect module-level mutable names ─────────────────────────────
+    def add_finding(kind, node, finding_type, code=None):
+        findings[kind].append({
+            "line": getattr(node, "lineno", 0),
+            "code": code if code is not None else get_line(node),
+            "type": finding_type,
+        })
+
+    def mark_parents(root):
+        for parent in ast.walk(root):
+            for child in ast.iter_child_nodes(parent):
+                child._parent = parent
+
+    def is_with_open_call(node):
+        parent = getattr(node, "_parent", None)
+        while parent is not None:
+            if isinstance(parent, ast.withitem):
+                return True
+            if isinstance(parent, (ast.With, ast.AsyncWith)):
+                return True
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+                return False
+            parent = getattr(parent, "_parent", None)
+        return False
+
+    def contains_error_signal(text):
+        tl = (text or "").lower()
+        return any(s in tl for s in ["indexerror", "keyerror", "zero division", "zerodivisionerror"])
+
+    mark_parents(tree)
+
     mutable_globals = []
-    MUTABLE_BUILTINS = {"dict", "list", "defaultdict", "set", "OrderedDict"}
-
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.Assign):
             for t in node.targets:
@@ -102,105 +239,212 @@ def ast_detect_bugs(source: str) -> list:
                         func_name = v.func.id
                     elif isinstance(v.func, ast.Attribute):
                         func_name = v.func.attr
-                    if func_name in MUTABLE_BUILTINS:
+                    if func_name in mutable_builtins:
                         mutable_globals.append((t.id, node.lineno))
 
     if len(mutable_globals) >= 2:
         names = ", ".join(f"`{n}`" for n, _ in mutable_globals)
-        first_line = mutable_globals[0][1]
-        bugs.append({
-            "line": first_line,
+        findings["bugs"].append({
+            "line": mutable_globals[0][1],
             "code": f"{names} — module-level mutable state",
-            "type": "stale globals — move ALL inside entry function, pass to helpers"
+            "type": "stale globals — move mutable state inside entry function and pass to helpers",
         })
 
-    # ── Pass 2: walk all nodes ─────────────────────────────────────────────────
     class BugVisitor(ast.NodeVisitor):
-
         def visit_Assign(self, node):
-            if (
-                isinstance(node.value, ast.UnaryOp)
-                and isinstance(node.value.op, ast.UAdd)
-            ):
-                bugs.append({
-                    "line": node.lineno,
-                    "code": get_line(node),
-                    "type": "=+ instead of +="
-                })
+            line = get_line(node).replace(" ", "")
+            if "=+" in line:
+                add_finding("bugs", node, "=+ instead of +=")
             self.generic_visit(node)
 
         def visit_BinOp(self, node):
-            if isinstance(node.op, ast.Div):
-                bugs.append({
-                    "line": node.lineno,
-                    "code": get_line(node),
-                    "type": "division — verify denominator != 0 (trace call-site arguments)"
-                })
+            if isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
+                add_finding("risks", node, "possible division-like risk — verify denominator cannot become 0")
             self.generic_visit(node)
 
         def visit_Call(self, node):
             func_name = ""
             if isinstance(node.func, ast.Name):
                 func_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                func_name = node.func.attr
+
             if func_name in ("max", "min") and node.args:
-                bugs.append({
-                    "line": node.lineno,
-                    "code": get_line(node),
-                    "type": f"{func_name}() on possibly empty container — add empty guard"
-                })
+                has_default = any(kw.arg == "default" for kw in node.keywords)
+                if not has_default:
+                    add_finding(
+                        "risks",
+                        node,
+                        f"potential empty-container risk in {func_name}() — consider guard if input can be empty",
+                    )
+
+            if func_name == "open" and not is_with_open_call(node):
+                add_finding(
+                    "smells",
+                    node,
+                    "resource-handling smell — consider `with open(...)` for automatic close",
+                )
+
             self.generic_visit(node)
 
         def visit_Compare(self, node):
-            has_gte = any(isinstance(op, (ast.GtE, ast.LtE, ast.Gt, ast.Lt)) for op in node.ops)
-            left_is_subscript = isinstance(node.left, ast.Subscript)
+            has_order_compare = any(isinstance(op, (ast.GtE, ast.LtE, ast.Gt, ast.Lt)) for op in node.ops)
+            if not has_order_compare or not node.comparators:
+                self.generic_visit(node)
+                return
+
+            left_has_strftime = any(
+                isinstance(c, ast.Attribute) and c.attr == "strftime"
+                for c in ast.walk(node.left)
+            )
             right_has_strftime = any(
                 isinstance(c, ast.Attribute) and c.attr == "strftime"
-                for c in ast.walk(ast.Expression(body=node))
+                for comp in node.comparators
+                for c in ast.walk(comp)
             )
-            if has_gte and left_is_subscript and right_has_strftime:
-                bugs.append({
-                    "line": node.lineno,
-                    "code": get_line(node),
-                    "type": "date string comparison — lexicographic; parse back to datetime"
-                })
+
+            if left_has_strftime or right_has_strftime:
+                add_finding(
+                    "risks",
+                    node,
+                    "potential date-string comparison risk — verify formatted strings are safe for ordering",
+                )
+
+            self.generic_visit(node)
+
+        def visit_ExceptHandler(self, node):
+            if node.type is None:
+                add_finding("bugs", node, "bare except — catches everything and hides real failures")
+            elif isinstance(node.type, ast.Name) and node.type.id == "Exception":
+                if any(isinstance(stmt, ast.Pass) for stmt in node.body):
+                    add_finding("bugs", node, "except Exception: pass — swallows errors")
+            self.generic_visit(node)
+
+        def visit_Try(self, node):
+            exception_types = []
+            for handler in node.handlers:
+                if isinstance(handler.type, ast.Name):
+                    exception_types.append(handler.type.id)
+                elif handler.type is None:
+                    exception_types.append("BaseException")
+                else:
+                    exception_types.append("other")
+
+            if "Exception" in exception_types:
+                idx = exception_types.index("Exception")
+                if idx < len(exception_types) - 1:
+                    add_finding(
+                        "bugs",
+                        node.handlers[idx],
+                        "incorrect exception ordering — broad `Exception` handler may shadow narrower handlers",
+                    )
+
+            if "BaseException" in exception_types:
+                idx = exception_types.index("BaseException")
+                if idx < len(exception_types) - 1:
+                    add_finding(
+                        "bugs",
+                        node.handlers[idx],
+                        "incorrect exception ordering — bare except may shadow narrower handlers",
+                    )
+
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node):
+            self._check_function(node)
+            self.generic_visit(node)
+
+        def visit_AsyncFunctionDef(self, node):
+            self._check_function(node)
+            self.generic_visit(node)
+
+        def _check_function(self, node):
+            for default in node.args.defaults:
+                if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                    add_finding("bugs", default, f"mutable default argument in `{node.name}`")
+                elif isinstance(default, ast.Call):
+                    func_name = ""
+                    if isinstance(default.func, ast.Name):
+                        func_name = default.func.id
+                    elif isinstance(default.func, ast.Attribute):
+                        func_name = default.func.attr
+                    if func_name in mutable_builtins:
+                        add_finding("bugs", default, f"mutable default argument in `{node.name}`")
+
+            returns = [sub.value is not None for sub in ast.walk(node) if isinstance(sub, ast.Return)]
+            if returns and any(returns) and not all(returns):
+                add_finding("bugs", node, f"inconsistent returns in `{node.name}` — some paths return values, others do not")
+
+            self._detect_unreachable(node.body)
+
+        def _detect_unreachable(self, stmts):
+            for i, stmt in enumerate(stmts[:-1]):
+                if isinstance(stmt, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+                    unreachable_stmt = stmts[i + 1]
+                    add_finding(
+                        "bugs",
+                        unreachable_stmt,
+                        "unreachable code — this statement cannot run because control flow already exits earlier",
+                    )
+
+                nested_blocks = []
+                if isinstance(stmt, ast.If):
+                    nested_blocks.extend([stmt.body, stmt.orelse])
+                elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                    nested_blocks.extend([stmt.body, stmt.orelse])
+                elif isinstance(stmt, (ast.With, ast.AsyncWith, ast.Try)):
+                    nested_blocks.append(stmt.body)
+                    if hasattr(stmt, "orelse"):
+                        nested_blocks.append(stmt.orelse)
+                    if hasattr(stmt, "finalbody"):
+                        nested_blocks.append(stmt.finalbody)
+                    if isinstance(stmt, ast.Try):
+                        for handler in stmt.handlers:
+                            nested_blocks.append(handler.body)
+
+                for block in nested_blocks:
+                    if block:
+                        self._detect_unreachable(block)
+
+        def visit_Subscript(self, node):
+            if contains_error_signal(logs) and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int):
+                add_finding(
+                    "risks",
+                    node,
+                    "possible indexing risk — logs suggest an indexing failure, verify bounds before positional access",
+                )
             self.generic_visit(node)
 
     BugVisitor().visit(tree)
 
-    seen = set()
-    unique = []
-    for b in bugs:
-        key = (b["line"], b["type"][:30])
-        if key not in seen:
-            seen.add(key)
-            unique.append(b)
+    for kind in findings:
+        seen = set()
+        unique = []
+        for f in findings[kind]:
+            key = (f["line"], f["type"][:100], f["code"][:180])
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+        unique.sort(key=lambda x: x["line"])
+        findings[kind] = unique
 
-    unique.sort(key=lambda b: b["line"])
-    return unique
+    return findings
 
 
 # ─── Prompt helpers ────────────────────────────────────────────────────────────
 
+
 def _get_fix_principles() -> str:
     return (
         "### Fix principles:\n"
-        "1. When guarding against a zero/empty/None value, the safe fallback must be "
-        "semantically correct — not just syntactically safe. "
-        "Ask: what should the caller receive when the value is missing? "
-        "Return that value, not an arbitrary substitute like 1 or 'dummy'.\n"
-        "   Good: `return a / b if b != 0 else 0`  ← 0 is the correct answer when there is nothing to divide\n"
-        "   Bad:  `return a / (b if b != 0 else 1)` ← silently returns wrong result\n\n"
-        "2. When a container guard is needed, use an explicit `if container` check — "
-        "not a keyword argument that does not exist on the built-in.\n"
-        "   Good: `return max(items, key=...) if items else None`\n"
-        "   Bad:  `return max(items, key=..., default=None)` ← max() has no default kwarg\n\n"
-        "3. When a mutable value is passed to a helper by value (e.g. an int counter), "
-        "changes inside the helper are invisible to the caller. "
-        "The helper must return the updated value and the caller must reassign it.\n"
-        "   Good: `count = helper(..., count)` where helper does `return count + 1`\n"
-        "   Bad:  `helper(..., count)` and expecting count to change\n\n"
-        "4. When fixing stale globals, move ALL mutable module-level variables inside "
-        "the entry function. Pass every one as a parameter to every helper that uses them.\n\n"
+        "1. When guarding against a zero/empty/None value, the fallback must be semantically correct.\n"
+        "2. Use explicit empty-container guards for risky operations.\n"
+        "3. If helper functions update values such as counters, they must return the updated value.\n"
+        "4. Move mutable module-level state into the entry function and pass it explicitly.\n"
+        "5. Make inconsistent return paths consistent.\n"
+        "6. Do not swallow real failures with broad exception handlers.\n"
+        "7. If the same bug appears multiple times, report it once.\n"
+        "8. For lower-confidence risks, report them only when code or logs support them.\n\n"
     )
 
 
@@ -208,58 +452,34 @@ def _get_examples() -> str:
     return (
         "### Output format — copy exactly:\n\n"
         "Bug 1:\n"
-        "Issue: `totals[tag][\"sum\"] =+ score`\n"
-        "Explanation: `=+` sets sum to score every call instead of accumulating.\n"
-        "Fix:\n"
-        "```python\n"
-        "totals[tag][\"sum\"] += score\n"
-        "```\n\n"
-        "Bug 2:\n"
         "Issue: `hits =+ 1`\n"
-        "Explanation: `=+` resets hits to 1 every call instead of incrementing.\n"
+        "Explanation: `=+` resets the value instead of incrementing it.\n"
         "Fix:\n"
         "```python\n"
         "hits += 1\n"
         "```\n\n"
-        "Bug 3:\n"
-        "Issue: `hits = 0`, `cache = {}`, `totals = defaultdict(dict)` — module-level mutable state\n"
-        "Explanation: Stale data bleeds between runs. Move ALL inside entry function, pass to helpers.\n"
+        "Bug 2:\n"
+        "Issue: `return total / count`\n"
+        "Explanation: This can raise ZeroDivisionError when count is 0.\n"
         "Fix:\n"
         "```python\n"
-        "def run(items):\n"
-        "    hits = 0\n"
-        "    cache = {}\n"
-        "    totals = defaultdict(dict)\n"
-        "    for item in items:\n"
-        "        hits = process(item[\"id\"], item[\"score\"], cache, totals, hits)\n"
+        "return total / count if count else 0\n"
+        "```\n\n"
+        "Bug 3:\n"
+        "Issue: `def add(x, seen=[]):`\n"
+        "Explanation: Mutable default arguments are shared across calls.\n"
+        "Fix:\n"
+        "```python\n"
+        "def add(x, seen=None):\n"
+        "    seen = [] if seen is None else seen\n"
         "```\n\n"
         "Bug 4:\n"
-        "Issue: `return score / base * 100`\n"
-        "Explanation: Caller passes `score - 10` as base — when score==10, base==0, ZeroDivisionError.\n"
+        "Issue: `except Exception: pass`\n"
+        "Explanation: This swallows real failures and hides debugging evidence.\n"
         "Fix:\n"
         "```python\n"
-        "return (score / base) * 100 if base != 0 else 0\n"
-        "```\n\n"
-        "Bug 5:\n"
-        "Issue: `max(cache, key=lambda x: cache[x][\"score\"])`\n"
-        "Explanation: ValueError when cache is empty on second clean run.\n"
-        "Fix:\n"
-        "```python\n"
-        "return max(cache, key=lambda x: cache[x][\"score\"]) if cache else None\n"
-        "```\n\n"
-        "Bug 6:\n"
-        "Issue: `return totals[tag][\"sum\"] / totals[tag][\"count\"]`\n"
-        "Explanation: ZeroDivisionError when count is 0.\n"
-        "Fix:\n"
-        "```python\n"
-        "return totals[tag][\"sum\"] / totals[tag][\"count\"] if totals[tag][\"count\"] else 0\n"
-        "```\n\n"
-        "Bug 7:\n"
-        "Issue: `if v[\"joined\"] >= cutoff.strftime(\"%d-%m-%Y\")`\n"
-        "Explanation: Lexicographic string comparison — \"05-03-2026\" > \"20-01-2026\" is False but should be True.\n"
-        "Fix:\n"
-        "```python\n"
-        "if datetime.datetime.strptime(v[\"joined\"], \"%d-%m-%Y\") >= cutoff\n"
+        "except Exception:\n"
+        "    raise\n"
         "```\n\n"
     )
 
@@ -267,49 +487,67 @@ def _get_examples() -> str:
 def _get_output_rules() -> str:
     return (
         "### Output rules:\n"
-        "- Quote the exact buggy line for every bug\n"
-        "- Fix block: corrected code only, 1-3 lines\n"
-        "- Silent about non-bugs — never write 'not a bug' or 'no change needed'\n"
-        "- Start numbering at Bug 1\n"
-        "- No ### headers, no bullet format\n\n"
+        "- Quote the exact buggy line for every bug.\n"
+        "- Fix block: corrected code only, 1-4 lines.\n"
+        "- Silent about non-bugs.\n"
+        "- Start numbering at Bug 1.\n"
+        "- No bullet format outside Bug N blocks.\n"
+        "- Do not repeat duplicate or near-duplicate bugs.\n"
+        "- Only report real bugs in the final Bug N output.\n\n"
     )
 
 
-def _build_slim_prompt(confirmed_bugs: list, code: str, logs: str,
-                       query: str, context_str: str,
-                       first_answer: str = "") -> str:
-    logs_text = logs.strip() if logs and logs.strip() else "No logs provided."
+def _format_findings(findings: dict) -> str:
+    parts = []
 
-    if confirmed_bugs:
-        bug_list = "\n".join(
-            f"  - Line {b['line']}: `{b['code']}` — {b['type']}"
-            for b in confirmed_bugs
-        )
-        task = (
-            f"### Confirmed bugs (static analysis):\n{bug_list}\n\n"
-            "### Your job:\n"
-            "1. Write a Bug N block for each confirmed bug above.\n"
-            "2. Start numbering at Bug 1.\n"
-            "3. Check logs for additional semantic bugs NOT in the list.\n\n"
-        )
-    else:
-        task = (
-            "### Your job:\n"
-            "Analyze the code and logs. Report only clearly visible bugs.\n"
-            "Start numbering at Bug 1.\n\n"
-        )
+    if findings["bugs"]:
+        parts.append("High-confidence bugs:")
+        parts.extend(f"- Line {b['line']}: `{b['code']}` — {b['type']}" for b in findings["bugs"])
+
+    if findings["risks"]:
+        parts.append("\nPotential runtime risks (include only if supported by code/logs):")
+        parts.extend(f"- Line {r['line']}: `{r['code']}` — {r['type']}" for r in findings["risks"])
+
+    if findings["smells"]:
+        parts.append("\nCode smells (do NOT report unless directly relevant to a real bug):")
+        parts.extend(f"- Line {s['line']}: `{s['code']}` — {s['type']}" for s in findings["smells"])
+
+    return "\n".join(parts) if parts else "None"
+
+
+def _build_prompt(
+    findings: dict,
+    code: str,
+    logs: str,
+    query: str,
+    context_str: str,
+    first_answer: str = "",
+) -> str:
+    logs_text = logs.strip() if logs and logs.strip() else "No logs provided."
 
     if first_answer:
         task = (
             f"### Already reported — do NOT repeat:\n{first_answer}\n\n"
             "### Your job:\n"
-            "Find ONLY bugs missed above. If none → reply: No additional bugs found.\n"
-            "Continue Bug N format.\n\n"
+            "Find ONLY clearly supported real bugs missed above.\n"
+            "Do not add speculative issues.\n"
+            "Do not convert smells into bugs.\n"
+            "If none, reply exactly: No additional bugs found.\n\n"
+        )
+    else:
+        task = (
+            f"### Static findings:\n{_format_findings(findings)}\n\n"
+            "### Your job:\n"
+            "1. Write a Bug N block for each high-confidence bug.\n"
+            "2. Include a potential runtime risk only if the code or logs support it as a real bug.\n"
+            "3. Do not report code smells unless they directly explain a real failure.\n"
+            "4. Also find any other real Python bug supported by the code or logs.\n"
+            "5. Do not repeat the same bug twice.\n\n"
         )
 
     return (
         "### Instruction:\n"
-        "You are a senior software engineer. Find and fix every bug in the code below.\n\n"
+        "You are a senior Python software engineer. Find and fix real bugs in the code below.\n\n"
         + task
         + _get_fix_principles()
         + _get_output_rules()
@@ -318,128 +556,156 @@ def _build_slim_prompt(confirmed_bugs: list, code: str, logs: str,
         + f"### Logs:\n{logs_text}\n\n"
         + f"### Question:\n{query}\n\n"
         + f"### Context:\n{context_str}\n\n"
-        + "### Response (Bug N: format only):\n"
+        + "### Response:\n"
     )
 
 
 # ─── LLM passes ───────────────────────────────────────────────────────────────
 
-def generate_answer(confirmed_bugs: list, query: str, code: str, logs: str) -> str:
-    context = retrieve(query)
-    context_str = "\n- ".join(context) if context else "No relevant context."
-    return call_ollama(_build_slim_prompt(confirmed_bugs, code, logs, query, context_str))
+
+def generate_answer(findings: dict, query: str, code: str, logs: str, context_str: str) -> str:
+    return call_ollama(_build_prompt(findings, code, logs, query, context_str))
 
 
-def second_pass(confirmed_bugs: list, query: str, code: str,
-                logs: str, first_answer: str) -> str:
-    context = retrieve(query)
-    context_str = "\n- ".join(context) if context else "No relevant context."
+def second_pass(findings: dict, query: str, code: str, logs: str, first_answer: str, context_str: str) -> str:
     return call_ollama(
-        _build_slim_prompt(confirmed_bugs, code, logs, query, context_str,
-                           first_answer=first_answer)
+        _build_prompt(
+            findings,
+            code,
+            logs,
+            query,
+            context_str,
+            first_answer=first_answer,
+        )
     )
 
 
 def critique_answer(query: str, code: str, logs: str, answer: str) -> str:
     logs_text = logs.strip() if logs and logs.strip() else "No logs provided."
+
     prompt = (
         "### Instruction:\n"
-        "You are a strict code reviewer. Check this answer against the code.\n\n"
+        "You are a strict Python code-review critic. Review the answer against the code and logs.\n\n"
         "### Checklist:\n"
-        "1. Every bug quotes an EXACT line from the code — not invented.\n"
-        "2. Every `=+` line is caught.\n"
-        "3. ALL mutable globals flagged + fix passes them as parameters to every helper.\n"
-        "4. Call-chain division: does the denominator become 0 given real input values?\n"
-        "5. `max()`/`min()` — is the empty guard `if container else None` (not a kwarg)?\n"
-        "6. Division guard returns 0 on zero denominator (not `else 1` or other substitute).\n"
-        "7. Date string comparison bug caught with correct stored format.\n"
-        "8. Int counters passed to helpers: does helper return updated value, caller reassign?\n"
-        "9. No duplicates. No non-existent kwarg usage. No thread/lock suggestions.\n"
-        "10. No 'not a bug' or 'no change needed' entries.\n\n"
+        "1. Every bug quotes an exact line from the code.\n"
+        "2. Bugs are real and supported.\n"
+        "3. No duplicate or near-duplicate bug reports exist.\n"
+        "4. Fixes are minimal and correct.\n"
+        "5. Mutable default argument bugs are caught when present.\n"
+        "6. Broad exception swallowing is caught when present.\n"
+        "7. Inconsistent return-path bugs are caught when present.\n"
+        "8. No invented kwargs, locks, threads, or speculative fixes.\n"
+        "9. No 'not a bug' or 'no change needed' entries.\n\n"
+        "### Rules:\n"
+        "- Do not invent new bugs.\n"
+        "- If you claim a bug is wrong or missing, mention the exact quoted line involved.\n\n"
         f"### Code:\n```python\n{code}\n```\n\n"
         f"### Logs:\n{logs_text}\n\n"
         f"### Answer:\n{answer}\n\n"
         "### Response (ONLY this format):\n"
         "Correct? YES\nErrors found: None\nWhat to fix: Nothing\n\n"
-        "OR:\n\n"
+        "OR\n\n"
         "Correct? NO\n"
         "Errors found: <specific>\n"
-        "What to fix: <one instruction>\n"
+        "What to fix: <one instruction tied to quoted lines>\n"
     )
     return call_ollama(prompt)
 
 
-def refine_answer(query: str, code: str, logs: str,
-                  answer: str, critique: str) -> str:
+def refine_answer(query: str, code: str, logs: str, answer: str, critique: str) -> str:
+    logs_text = logs.strip() if logs and logs.strip() else "No logs provided."
+
     what_to_fix = ""
     for line in critique.splitlines():
         if line.lower().startswith("what to fix:"):
             what_to_fix = line.split(":", 1)[-1].strip()
             break
-    logs_text = logs.strip() if logs and logs.strip() else "No logs provided."
+
     prompt = (
         "### Instruction:\n"
-        "Fix the answer per critique. Apply fix principles carefully.\n\n"
+        "Fix the answer using the critique.\n"
+        "Keep valid bugs, correct wrong ones, and remove duplicate or invented bugs.\n"
+        "Do NOT introduce a new bug unless it is directly supported by an exact quoted code line already mentioned in the critique.\n\n"
         + _get_fix_principles()
         + f"### What to fix:\n{what_to_fix or critique}\n\n"
-        "### Rules:\n"
-        "- KEEP valid bugs\n"
-        "- ADD confirmed missing bugs\n"
-        "- REMOVE: invented lines, duplicates, non-existent kwargs, "
-        "wrong fallback values, thread/lock suggestions, 'not a bug' entries\n"
-        "- Bug N: / Issue: / Explanation: / Fix: format only\n\n"
-        f"### Code:\n```python\n{code}\n```\n\n"
-        f"### Logs:\n{logs_text}\n\n"
-        f"### Answer:\n{answer}\n\n"
-        "### Response:\n"
+        + f"### Code:\n```python\n{code}\n```\n\n"
+        + f"### Logs:\n{logs_text}\n\n"
+        + f"### Previous answer:\n{answer}\n\n"
+        + "### Response:\n"
     )
     return call_ollama(prompt)
 
 
 # ─── Deduplication ─────────────────────────────────────────────────────────────
 
+
 def deduplicate_bugs(text: str) -> str:
-    text = text.replace("--- Additional Bugs Found ---", "").strip()
+    text = (text or "").replace("--- Additional Bugs Found ---", "").strip()
 
     seen = set()
     output = []
     current_block = []
 
-    def _fingerprint(block):
-        issue = next(
-            (l.lower().strip() for l in block if l.strip().lower().startswith("issue:")), ""
-        )
-        in_fix, fix_line = False, ""
-        for l in block:
-            if l.strip().startswith("```python"):
+    def normalize(s: str) -> str:
+        s = s.lower().strip()
+        s = re.sub(r"`+", "", s)
+        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"[^a-z0-9_:/().<>= \-]", "", s)
+        return s
+
+    def extract_issue_line(block):
+        for line in block:
+            stripped = line.strip()
+            if stripped.lower().startswith("issue:"):
+                return stripped.split(":", 1)[1].strip()
+        return ""
+
+    def extract_fix_head(block):
+        in_fix = False
+        for line in block:
+            stripped = line.strip()
+            if stripped.startswith("```python"):
                 in_fix = True
                 continue
-            if in_fix and l.strip() and not l.strip().startswith("```"):
-                fix_line = l.lower().strip()
-                break
-        return issue + "|" + fix_line
+            if stripped.startswith("```") and in_fix:
+                in_fix = False
+                continue
+            if in_fix and stripped:
+                return stripped
+        return ""
+
+    def fingerprint(block):
+        issue_line = extract_issue_line(block)
+        fix_head = extract_fix_head(block)
+        line_match = re.search(r"line\s+(\d+)", normalize("\n".join(block)))
+        line_no = line_match.group(1) if line_match else ""
+        return "|".join([
+            normalize(line_no),
+            normalize(issue_line),
+            normalize(fix_head),
+        ])
+
+    def flush():
+        nonlocal current_block
+        if not current_block:
+            return
+        fp = fingerprint(current_block)
+        if fp and fp not in seen:
+            seen.add(fp)
+            output.extend(current_block)
+        elif not fp.strip("|"):
+            output.extend(current_block)
+        current_block = []
 
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped.lower().startswith("bug ") and ":" in stripped and len(stripped) < 20:
-            if current_block:
-                fp = _fingerprint(current_block)
-                if fp and fp not in seen:
-                    seen.add(fp)
-                    output.extend(current_block)
-                elif not fp.strip("|"):
-                    output.extend(current_block)
+        if re.match(r"(?i)^bug\s+\d+\s*:$", stripped):
+            flush()
             current_block = [line]
         else:
             current_block.append(line)
 
-    if current_block:
-        fp = _fingerprint(current_block)
-        if fp and fp not in seen:
-            output.extend(current_block)
-        elif not fp.strip("|"):
-            output.extend(current_block)
-
+    flush()
     return "\n".join(output)
 
 
@@ -452,100 +718,96 @@ def renumber_bugs(text: str, start: int = 1) -> str:
         counter += 1
         return value
 
-    return re.sub(
-        r"(?im)^bug\s+\d+\s*:",
-        repl,
-        text,
-        flags=re.MULTILINE
-    )
+    return re.sub(r"(?im)^bug\s+\d+\s*:", repl, text or "", flags=re.MULTILINE)
 
 
 # ─── Response quality filters ─────────────────────────────────────────────────
 
+
 def is_bad_response(text: str) -> bool:
-    tl = text.lower()
-    bad = [
-        "fibonacci", "i don't see any code", "no code was provided",
-        "without running", "speculative", "impossible to find",
-        "from queue import", "lock = lock()", "with lock:",
-        "lock.acquire", "semaphore", "asyncio", "multiprocessing",
-        "error after 3 attempts", "error after 2 attempts",
-        "i'm ready", "i am ready", "please provide the code",
-        "waiting for the code", "ready to analyze",
-        "t.join()", "race condition",
-        ".clear()  # clear", "active_sessions.clear()",
-        "sale_registry.clear()", "user_registry.clear()",
-        "dept_scores.clear()",
-        "### bug 1", "### bug 2", "### bug 3",
-        "- **description**:", "- **impact**:",
-        "+ 0.001", "+ 1e-", "epsilon",
-        "else 1))", "else 1) *", "!= 0 else 1)",
-        ", default=none)", "default=none",
-        "no change needed", "is already correct",
-        "not a bug here", "no bug here", "not a bug",
+    tl = (text or "").lower()
+    bad_terms = [
+        "i don't see any code",
+        "no code was provided",
+        "please provide the code",
+        "waiting for the code",
+        "ready to analyze",
+        "i'm ready",
+        "i am ready",
+        "not a bug here",
+        "no bug here",
+        "no change needed",
+        "is already correct",
+        "lock.acquire",
+        "with lock:",
+        "semaphore",
+        "thread.join",
+        "race condition",
+        "default=none",
     ]
-    return any(w in tl for w in bad)
+    return not tl.strip() or any(term in tl for term in bad_terms)
 
 
 def is_correct_line_flagged(text: str) -> bool:
+    tl = (text or "").lower()
     signals = [
-        "count += 1` is correct",
-        "count += 1` does not need",
-        "already correct. no bug",
         "is already correct",
         "no bug here",
         "no change needed",
-        "is correct. no",
         "not a bug",
+        "already correct. no bug",
     ]
-    tl = text.lower()
-    return any(s.lower() in tl for s in signals)
+    return any(s in tl for s in signals)
 
 
 # ─── Pipeline ─────────────────────────────────────────────────────────────────
 
+
 def run_pipeline(query: str, code: str, logs: str) -> dict:
-    if is_off_topic(query, code):
+    query = query or ""
+    code = code or ""
+    logs = logs or ""
+
+    decision = route_prompt(query, code, logs)
+    if decision != "DEBUG":
         return {
-            "ast_bugs": [],
-            "initial_answer": "This tool only answers code debugging questions.",
-            "critique": "Skipped — off-topic",
-            "final_answer": "This tool only answers code debugging questions. Please provide a code snippet."
+            "ast_bugs": {"bugs": [], "risks": [], "smells": []},
+            "initial_answer": IRRELEVANT_MESSAGE,
+            "critique": "Skipped — irrelevant prompt",
+            "final_answer": IRRELEVANT_MESSAGE,
         }
 
-    if not code or not code.strip():
+    if not code.strip():
         return {
-            "ast_bugs": [],
-            "initial_answer": "No code provided.",
+            "ast_bugs": {"bugs": [], "risks": [], "smells": []},
+            "initial_answer": "Please provide the Python code snippet or traceback to debug.",
             "critique": "Skipped — no code",
-            "final_answer": "No code provided. Please paste a code snippet to debug."
+            "final_answer": "Please provide the Python code snippet or traceback to debug.",
         }
 
-    if not query or not query.strip():
-        query = "Identify all the bugs"
-    if logs is None:
-        logs = ""
+    if not query.strip():
+        query = "Identify all real Python bugs and errors."
 
-    # Step 1 — deterministic AST pre-detection
-    confirmed_bugs = ast_detect_bugs(code)
+    context_str = _get_context(query, code, logs)
+    findings = ast_detect_bugs(code, logs=logs)
 
-    # Step 2 — LLM first pass (retry once if bad)
-    initial = generate_answer(confirmed_bugs, query, code, logs)
+    initial = generate_answer(findings, query, code, logs, context_str)
     if is_bad_response(initial) or is_correct_line_flagged(initial):
-        initial = generate_answer(confirmed_bugs, query, code, logs)
+        initial = generate_answer(findings, query, code, logs, context_str)
+
     if is_bad_response(initial):
+        clean_initial = renumber_bugs(initial, start=1)
         return {
-            "ast_bugs": confirmed_bugs,
-            "initial_answer": renumber_bugs(initial, start=1),
+            "ast_bugs": findings,
+            "initial_answer": clean_initial,
             "critique": "Skipped — bad initial response",
-            "final_answer": renumber_bugs(initial, start=1)
+            "final_answer": clean_initial,
         }
 
-    # Step 3 — second pass for code > 20 lines
     combined = initial
     if len(code.strip().splitlines()) > 20:
         try:
-            second = second_pass(confirmed_bugs, query, code, logs, initial)
+            second = second_pass(findings, query, code, logs, initial, context_str)
             if (
                 second
                 and "no additional bugs found" not in second.lower()
@@ -556,51 +818,26 @@ def run_pipeline(query: str, code: str, logs: str) -> dict:
         except Exception:
             pass
 
-    # Step 4 — dedup
     combined = deduplicate_bugs(combined)
 
-    # Step 5 — critique + refine (only when logs present)
     critique = "Skipped"
     final = combined
-    if logs and logs.strip():
-        try:
-            critique = critique_answer(query, code, logs, combined)
-            correct_line = critique.lower().split("correct?")[-1][:30]
+    try:
+        critique = critique_answer(query, code, logs, combined)
+        if "correct? no" in critique.lower():
+            refined = refine_answer(query, code, logs, combined, critique)
+            if not is_bad_response(refined) and not is_correct_line_flagged(refined):
+                final = deduplicate_bugs(refined)
+    except Exception:
+        critique = "Skipped — critique/refine failed"
+        final = combined
 
-            if "no" in correct_line:
-                refined = refine_answer(query, code, logs, combined, critique)
-                ef = critique.lower()
-                removing = any(w in ef for w in [
-                    "duplicate", "remove", "thread.join", "race condition",
-                    ".clear()", "wrong fix", "correct line", "invented",
-                    "not in the code", "epsilon", "not a bug", "no change needed",
-                    "not allowed", "wrong fallback", "else 1", "default=none",
-                    "non-existent kwarg", "kwarg",
-                ])
-                adding = any(w in ef for w in [
-                    "missed", "not found", "not all globals", "second =+",
-                    "date string", "avg", "helpers", "call chain",
-                    "denominator", "counter", "reassign", "return updated",
-                ])
-
-                if not is_bad_response(refined) and not is_correct_line_flagged(refined):
-                    if removing or (adding and len(refined.strip()) > len(combined.strip())):
-                        final = deduplicate_bugs(refined)
-                    else:
-                        final = combined
-                else:
-                    final = combined
-        except Exception:
-            critique = "Skipped — timeout"
-            final = combined
-
-    # Step 6 — final dedup + force numbering from Bug 1
     final = deduplicate_bugs(final)
     final = renumber_bugs(final, start=1)
 
     return {
-        "ast_bugs": confirmed_bugs,
+        "ast_bugs": findings,
         "initial_answer": renumber_bugs(initial, start=1),
         "critique": critique,
-        "final_answer": final
+        "final_answer": final,
     }

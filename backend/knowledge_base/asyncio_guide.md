@@ -1,309 +1,144 @@
-# Asyncio Guide
-
-> Auto-generated from 1 sources
-
-## Source: https://docs.python.org/3/library/asyncio-task.html
-
-Coroutines and tasks — Python 3.14.4 documentation
-Navigation
-index
-modules
-|
-next
-|
-previous
-|
-Python
-»
-3.14.4 Documentation
-»
-The Python Standard Library
-»
-Networking and Interprocess Communication
-»
-asyncio
-â Asynchronous I/O
-»
-Coroutines and tasks
-|
-Theme
-Auto
-Light
-Dark
-|
-Coroutines and tasks
-Â¶
-This section outlines high-level asyncio APIs to work with coroutines
-and Tasks.
-Coroutines
-Â¶
-Source code:
-Lib/asyncio/coroutines.py
-Coroutines
-declared with the async/await syntax is the
-preferred way of writing asyncio applications.  For example, the following
-snippet of code prints âhelloâ, waits 1 second,
-and then prints âworldâ:
->>>
-import
-asyncio
->>>
-async
-def
-main
-():
-...
-print
-(
-'hello'
-)
-...
-await
-asyncio
-.
-sleep
-(
-1
-)
-...
-print
-(
-'world'
-)
->>>
-asyncio
-.
-run
-(
-main
-())
-hello
-world
-Note that simply calling a coroutine will not schedule it to
-be executed:
->>>
-main
-()
-<coroutine object main at 0x1053bb7c8>
-To actually run a coroutine, asyncio provides the following mechanisms:
-The
-asyncio.run()
-function to run the top-level
-entry point âmain()â function (see the above example.)
-Awaiting on a coroutine.  The following snippet of code will
-print âhelloâ after waiting for 1 second, and then print âworldâ
-after waiting for
-another
-2 seconds:
-import
-asyncio
-import
-time
-async
-def
-say_after
-(
-delay
-,
-what
-):
-await
-asyncio
-.
-sleep
-(
-delay
-)
-print
-(
-what
-)
-async
-def
-main
-():
-print
-(
-f
-"started at
-{
-time
-.
-strftime
-(
-'
-%X
-'
-)
-}
-"
-)
-await
-say_after
-(
-1
-,
-'hello'
-)
-await
-say_after
-(
-2
-,
-'world'
-)
-print
-(
-f
-"finished at
-{
-time
-.
-strftime
-(
-'
-%X
-'
-)
-}
-"
-)
-asyncio
-.
-run
-(
-main
-())
-Expected output:
-started
-at
-17
-:
-13
-:
-52
-hello
-world
-finished
-at
-17
-:
-13
-:
-55
-The
-asyncio.create_task()
-function to run coroutines
-concurrently as asyncio
-Tasks
-.
-Letâs modify the above example and run two
-say_after
-coroutines
-concurrently
-:
-async
-def
-main
-():
-task1
-=
-asyncio
-.
-create_task
-(
-say_after
-(
-1
-,
-'hello'
-))
-task2
-=
-asyncio
-.
-create_task
-(
-say_after
-(
-2
-,
-'world'
-))
-print
-(
-f
-"started at
-{
-time
-.
-strftime
-(
-'
-%X
-'
-)
-}
-"
-)
-# Wait until both tasks are completed (should take
-# around 2 seconds.)
-await
-task1
-await
-task2
-print
-(
-f
-"finished at
-{
-time
-.
-strftime
-(
-'
-%X
-'
-)
-}
-"
-)
-Note that expected output now shows that the snippet runs
-1 second faster than before:
-started
-at
-17
-:
-14
-:
-32
-hello
-world
-finished
-at
-17
-:
-14
-:
-34
-The
-asyncio.TaskGroup
-class provides a more modern
-alternative to
-create_task()
-.
-Using this API, the last example becomes:
-async
-def
-main
-():
-async
-with
-asyncio
-.
-TaskGroup
-()
-as
+# Asyncio — Common Errors and Fixes
 
 ---
 
+## Error: `RuntimeError: This event loop is already running`
+
+Cause: Calling `asyncio.run()` or `loop.run_until_complete()` inside an already-running async context (e.g. inside a FastAPI route or Jupyter).
+Fix:
+```python
+# Bad — inside async context
+asyncio.run(some_coroutine())
+
+# Good — just await it
+await some_coroutine()
+
+# Good — for sync blocking code inside async route
+result = await asyncio.to_thread(sync_blocking_fn, arg)
+```
+
+---
+
+## Error: `RuntimeError: no running event loop`
+
+Cause: Calling `asyncio.get_event_loop()` from a new thread or after the loop has been closed.
+Fix:
+```python
+# Bad
+loop = asyncio.get_event_loop()
+loop.run_until_complete(coro())
+
+# Good — always create a fresh loop in new threads
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+try:
+    loop.run_until_complete(coro())
+finally:
+    loop.close()
+```
+
+---
+
+## Error: `requests` blocks event loop inside `async def`
+
+Cause: `requests` is synchronous — calling it directly in an async function blocks the entire event loop, freezing all other coroutines.
+Fix:
+```python
+# Bad
+async def call_ollama(prompt):
+    resp = requests.post(OLLAMA_URL, json={...})   # blocks!
+    return resp.json()
+
+# Good — run in a thread pool
+async def call_ollama(prompt):
+    resp = await asyncio.to_thread(requests.post, OLLAMA_URL, json={...})
+    return resp.json()
+
+# Best — use httpx for true async HTTP
+import httpx
+async def call_ollama(prompt):
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(OLLAMA_URL, json={...}, timeout=180)
+        return resp.json()
+```
+
+---
+
+## Error: Coroutine never awaited — silently does nothing
+
+Cause: Calling an `async def` function without `await` returns a coroutine object that is never executed.
+Fix:
+```python
+# Bad — returns coroutine object, never runs
+result = some_async_fn()
+
+# Good
+result = await some_async_fn()
+```
+Python 3.11+ will emit a `RuntimeWarning: coroutine was never awaited` warning for this.
+
+---
+
+## Error: `asyncio.to_thread` not available
+
+Cause: `asyncio.to_thread()` was added in Python 3.9.
+Fix for Python 3.8:
+```python
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+executor = ThreadPoolExecutor()
+
+async def run_in_thread(fn, *args):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, fn, *args)
+```
+
+---
+
+## Error: Task exception was never retrieved
+
+Cause: `asyncio.create_task()` was used but the task result/exception was never awaited or checked.
+Fix:
+```python
+# Bad — exception silently lost
+task = asyncio.create_task(some_coro())
+
+# Good — always await or add a done callback
+task = asyncio.create_task(some_coro())
+try:
+    result = await task
+except Exception as e:
+    logger.error("Task failed: %s", e)
+```
+
+---
+
+## Error: Shared mutable state across coroutines causes race condition
+
+Cause: Multiple coroutines modifying the same dict/list concurrently — `await` points are context-switch points.
+Fix: Use `asyncio.Lock()` for shared state:
+```python
+lock = asyncio.Lock()
+shared_cache = {}
+
+async def update_cache(key, value):
+    async with lock:
+        shared_cache[key] = value
+```
+
+---
+
+## Error: `TimeoutError` — async operation hangs forever
+
+Cause: No timeout set on awaitable operations.
+Fix:
+```python
+import asyncio
+
+try:
+    result = await asyncio.wait_for(some_coro(), timeout=30.0)
+except asyncio.TimeoutError:
+    logger.error("Operation timed out")
+    result = None
+```
